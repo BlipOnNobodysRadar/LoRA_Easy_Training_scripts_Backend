@@ -369,19 +369,19 @@ def _get_fp32_work(
     value representable by the parameter dtype; it is not a second FP32
     parameter copy.
     """
-    if parameter.dtype not in (torch.float16, torch.bfloat16) or not kahan_sum:
+    if parameter.dtype not in (torch.float16, torch.bfloat16):
         return parameter.data
 
-    compensation = state.get("param_compensation")
-    if compensation is None or compensation.shape != parameter.shape:
-        compensation = torch.zeros_like(parameter, dtype=torch.float32)
-        state["param_compensation"] = compensation
-    elif compensation.dtype is not torch.float32 or compensation.device != parameter.device:
-        compensation = compensation.to(device=parameter.device, dtype=torch.float32)
-        state["param_compensation"] = compensation
-
     work = parameter.data.float()
-    work.add_(compensation)
+    if kahan_sum:
+        compensation = state.get("param_compensation")
+        if compensation is None or compensation.shape != parameter.shape:
+            compensation = torch.zeros_like(parameter, dtype=torch.float32)
+            state["param_compensation"] = compensation
+        elif compensation.dtype is not torch.float32 or compensation.device != parameter.device:
+            compensation = compensation.to(device=parameter.device, dtype=torch.float32)
+            state["param_compensation"] = compensation
+        work.add_(compensation)
     return work
 
 
@@ -516,9 +516,6 @@ def _spectral_meta_left_core(
     grad_positive = left_gain * torch.real(
         torch.conj(residual) * prev_spectrum
     ).sum(dim=1)
-    grad_positive = grad_positive * _spectral_rfft_weights(
-        prev.shape[0], left_gain
-    )
     grad_positive = grad_positive / prev.norm().square().clamp_min_(1e-12)
     grad = _spectral_expand_rfft_gradient(grad_positive, log_left.shape[0])
 
@@ -554,7 +551,6 @@ def _spectral_meta_bilateral_core(
     grad_right_positive = right_gain * torch.real(
         torch.conj(residual) * base_right
     ).sum(dim=0)
-    grad_right_positive = grad_right_positive * right_weights
 
     scale = 1.0 / prev.norm().square().clamp_min_(1e-12)
     grad_left = grad_left * scale
@@ -587,7 +583,6 @@ def _prepare_aino_update_2d(
     eps: float,
     step_t: torch.Tensor,
     sinkhorn_steps: int,
-    beta3: float,
     nesterov_value: bool,
     came_confidence: bool,
     exp_avg_res_row: torch.Tensor,
@@ -1138,7 +1133,8 @@ class WarpAINO(Optimizer):
         came_beta = group.get("came_beta", 0.9999)
         exp_avg_res_row = state.get("exp_avg_res_row", state["exp_avg_sq_row"])
         exp_avg_res_col = state.get("exp_avg_res_col", state["exp_avg_sq_col"])
-        spectral_log_left = state.get("spectral_log_left")
+        meta_lr = group.get("meta_lr", 0.0)
+        spectral_log_left = state.get("spectral_log_left") if meta_lr > 0 else None
 
         if spectral_log_left is not None:
             spectral_log_right = state.get("spectral_log_right")
@@ -1180,7 +1176,7 @@ class WarpAINO(Optimizer):
             )
             return update_final, crafted_update
 
-        warp = state.get("warp")
+        warp = state.get("warp") if meta_lr > 0 else None
         if warp is not None:
             update_final, crafted_update = self._compiled_warp_step_2d(
                 p_2d,
@@ -1321,7 +1317,6 @@ class WarpAINO(Optimizer):
             eps,
             step_t,
             sinkhorn_steps,
-            beta3,
             nesterov_value,
             came_confidence,
             exp_avg_res_row,
@@ -1443,7 +1438,6 @@ class WarpAINO(Optimizer):
             eps,
             step_t,
             sinkhorn_steps,
-            beta3,
             nesterov_value,
             came_confidence,
             exp_avg_res_row,
@@ -1519,7 +1513,6 @@ class WarpAINO(Optimizer):
             eps,
             step_t,
             sinkhorn_steps,
-            beta3,
             nesterov_value,
             came_confidence,
             exp_avg_res_row,
@@ -1596,13 +1589,6 @@ class WarpAINO(Optimizer):
                         state["exp_avg_sq_row"] = torch.zeros((m, 1), device=p.device, dtype=torch.float32)
                         state["exp_avg_sq_col"] = torch.zeros((1, n), device=p.device, dtype=torch.float32)
                         state["row_var"] = torch.zeros(m, device=p.device, dtype=torch.float32)
-                        if group["came_confidence"]:
-                            state["exp_avg_res_row"] = torch.zeros(
-                                (m, 1), device=p.device, dtype=torch.float32
-                            )
-                            state["exp_avg_res_col"] = torch.zeros(
-                                (1, n), device=p.device, dtype=torch.float32
-                            )
                         warp_m = m
                     else:
                         state["momentum"] = torch.zeros_like(p.data, dtype=torch.float32)
@@ -1615,29 +1601,44 @@ class WarpAINO(Optimizer):
                             p.data, dtype=torch.float32
                         )
 
-                    # Warp only matrix-like parameters. Biases, norm layers,
-                    # scalars, and DoRA scales remain on the plain 1D path.
-                    if group["meta_lr"] > 0 and p.ndim >= 2 and p.numel() > 1 and not (
-                        getattr(p, "is_scalar", False)
-                        or getattr(p, "is_bias", False)
-                        or getattr(p, "is_norm", False)
-                        or getattr(p, "_is_dora_scale", False)
-                    ):
+                # Initialize CAME confidence buffers if enabled
+                if group["came_confidence"] and p.ndim >= 2 and "exp_avg_res_row" not in state:
+                    w_2d = _reshape_to_2d(p.data)
+                    m, n = w_2d.shape
+                    state["exp_avg_res_row"] = torch.zeros(
+                        (m, 1), device=p.device, dtype=torch.float32
+                    )
+                    state["exp_avg_res_col"] = torch.zeros(
+                        (1, n), device=p.device, dtype=torch.float32
+                    )
+
+                # Warp only matrix-like parameters. Biases, norm layers,
+                # scalars, and DoRA scales remain on the plain 1D path.
+                # Lazily initialize if meta_lr becomes > 0 during training.
+                if group["meta_lr"] > 0 and p.ndim >= 2 and p.numel() > 1 and not (
+                    getattr(p, "is_scalar", False)
+                    or getattr(p, "is_bias", False)
+                    or getattr(p, "is_norm", False)
+                    or getattr(p, "_is_dora_scale", False)
+                ):
+                    if "warp" not in state and "spectral_log_left" not in state:
+                        w_2d = _reshape_to_2d(p.data)
+                        m, n = w_2d.shape
                         if group["warp_mode"] == "dense":
                             state["warp"] = torch.zeros(
-                                warp_m,
-                                warp_m,
+                                m,
+                                m,
                                 dtype=group["warp_dtype"],
                                 device=p.device,
                             )
                         else:
                             state["spectral_log_left"] = torch.zeros(
-                                warp_m, dtype=torch.float32, device=p.device
+                                m, dtype=torch.float32, device=p.device
                             )
                             # Only enable bilateral (right) spectral warp for hidden layers
                             if group["spectral_bilateral"] and getattr(p, "is_hidden", True):
                                 state["spectral_log_right"] = torch.zeros(
-                                    w_2d.shape[1],
+                                    n,
                                     dtype=torch.float32,
                                     device=p.device,
                                 )
@@ -1723,6 +1724,8 @@ class WarpAINO(Optimizer):
                     _writeback_fp32_work_(
                         p, p_2d_fp32.view_as(p.data), state, stochastic_fp, kahan_sum
                     )
+                elif p_2d_fp32.data_ptr() != p.data.data_ptr() or not p.data.is_contiguous():
+                    p.data.copy_(p_2d_fp32.view_as(p.data))
 
                 if spectral_log_left is not None:
                     self._run_spectral_meta_update(
@@ -1897,6 +1900,8 @@ class WarpAINO(Optimizer):
                     stochastic_fp,
                     kahan_sum,
                 )
+            elif p_fp32.data_ptr() != p.data.data_ptr() or not p.data.is_contiguous():
+                p.data.copy_(p_fp32.view_as(p.data))
 
         for state, crafted_update in meta_list:
             if "spectral_log_left" in state:
@@ -1907,7 +1912,7 @@ class WarpAINO(Optimizer):
                     meta_wd,
                     spectral_log_bound,
                 )
-            else:
+            elif "warp" in state:
                 _warp_meta_update(
                     state,
                     crafted_update,

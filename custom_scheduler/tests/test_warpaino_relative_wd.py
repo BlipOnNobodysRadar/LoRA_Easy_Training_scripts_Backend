@@ -21,7 +21,19 @@ import torch
 # Ensure the custom_scheduler package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from LoraEasyCustomOptimizer.warpaino import WarpAINO, _relative_wd_max_scale
+try:
+    from LoraEasyCustomOptimizer.warpaino import WarpAINO, _relative_wd_max_scale
+except ImportError:
+    import importlib.util
+
+    _module_path = os.path.join(
+        os.path.dirname(__file__), "..", "LoraEasyCustomOptimizer", "warpaino.py"
+    )
+    _spec = importlib.util.spec_from_file_location("warpaino_standalone", _module_path)
+    _module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_module)
+    WarpAINO = _module.WarpAINO
+    _relative_wd_max_scale = _module._relative_wd_max_scale
 
 
 DEVICE = "cuda"
