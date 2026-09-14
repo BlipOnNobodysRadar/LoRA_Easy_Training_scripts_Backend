@@ -267,6 +267,15 @@ def train(config, resume=None, cancelled=lambda: False):
                   "train_pairs": len(training_rows), "validation_pairs": len(validation_rows),
                   "synthetic": bool(training_rows[0].get("synthetic")),
                   "adapter_reports": model.adapter_reports, **metrics}
+        if status == "completed" and checkpoint_path and config["model"]["base_loras"]:
+            from .combined import export_combined
+            try:
+                report.update(export_combined(config, checkpoint_path / "preference_lora.safetensors",
+                              run_dir / f"combined_DPO_step{final_step:06d}.safetensors", cancelled))
+            except (ValueError, OSError) as error:
+                # An unsupported export must not invalidate a saved/resumable run.
+                report["combined_export_error"] = str(error)
+                print(f"Training checkpoint saved; combined export unavailable: {error}", flush=True)
         atomic_json(run_dir / "status.json", report)
         print(json.dumps(report, indent=2), flush=True)
         return report

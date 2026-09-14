@@ -119,10 +119,7 @@ def load_config(path):
         raise ValueError("Image dimensions must be multiples of 64 between 256 and 1536")
     if g["sampler"] not in ("euler", "ddim", "dpmpp_2m"):
         raise ValueError("Sampler must be euler, ddim, or dpmpp_2m")
-    if not isinstance(g["prompts"], list) or any(not isinstance(p, str) or not p.strip() for p in g["prompts"]):
-        raise ValueError("prompts must be a list of nonempty strings")
-    if not isinstance(g["negative_prompt"], str):
-        raise ValueError("negative_prompt must be a string")
+    g["prompts"] = prompt_entries(g)
     for name in ("seed", "split_seed"):
         if type(g[name]) is not int or not 0 <= g[name] < 2**63:
             raise ValueError(f"generation.{name} must be an integer from 0 through 2^63-1")
@@ -143,6 +140,40 @@ def load_config(path):
     if type(t["deterministic"]) is not bool:
         raise ValueError("deterministic must be true or false")
     return cfg
+
+
+def prompt_entries(generation):
+    """Normalize legacy strings and per-prompt objects without modifying input.
+
+    A legacy negative/count supplies defaults only. Explicit empty negatives
+    remain empty, and prompt newlines remain part of a single conditioning text.
+    """
+    prompts = generation.get("prompts", [])
+    negative = generation.get("negative_prompt", "")
+    pairs = generation.get("pairs_per_prompt", 1)
+    if not isinstance(prompts, list):
+        raise ValueError("generation.prompts must be a list")
+    if not isinstance(negative, str):
+        raise ValueError("generation.negative_prompt must be a string")
+    if type(pairs) is not int or pairs < 1:
+        raise ValueError("generation.pairs_per_prompt must be a positive integer")
+    result = []
+    for index, value in enumerate(prompts, 1):
+        if isinstance(value, str):
+            value = {"prompt": value}
+        if not isinstance(value, dict) or set(value) - {"prompt", "negative_prompt", "pairs"}:
+            raise ValueError(f"Prompt {index}: expected text or an object with prompt, negative_prompt and pairs")
+        prompt = value.get("prompt")
+        item_negative = value.get("negative_prompt", negative)
+        item_pairs = value.get("pairs", pairs)
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"Prompt {index}: enter a positive prompt or remove this row")
+        if not isinstance(item_negative, str):
+            raise ValueError(f"Prompt {index}: negative_prompt must be text")
+        if type(item_pairs) is not int or item_pairs < 1:
+            raise ValueError(f"Prompt {index}: pairs must be a positive integer")
+        result.append({"prompt": prompt, "negative_prompt": item_negative, "pairs": item_pairs})
+    return result
 
 
 def finite_number(value, name, positive=False):

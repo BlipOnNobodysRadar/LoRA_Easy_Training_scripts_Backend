@@ -22,6 +22,11 @@ def main(argv=None):
     export = sub.add_parser("export")
     export.add_argument("--dataset", required=True, type=Path)
     export.add_argument("--output", required=True, type=Path)
+    combined = sub.add_parser("combine", help="Export original adapters plus a DPO checkpoint as one inference LoRA")
+    combined.add_argument("--config", required=True, type=Path)
+    combined.add_argument("--preference", required=True, type=Path)
+    combined.add_argument("--output", required=True, type=Path)
+    combined.add_argument("--stop-file", type=Path)
     args = parser.parse_args(argv)
     if args.command in ("status", "export"):
         from .store import PreferenceStore
@@ -34,6 +39,13 @@ def main(argv=None):
     cancelled = lambda: bool(args.stop_file and args.stop_file.exists())
     if cancelled():
         print("Stop file already exists; no job started. Use a new stop-file path.")
+        return 0
+    if args.command == "combine":
+        from .combined import export_combined
+        try:
+            export_combined(cfg, args.preference, args.output, cancelled)
+        except InterruptedError as error:
+            print(str(error), flush=True)
         return 0
     from .jobs import gpu_lock, Timeout
     lock = gpu_lock()

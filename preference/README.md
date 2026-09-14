@@ -14,8 +14,13 @@ UNet LoRA**, leaving the input checkpoint and any starting adapters untouched.
   preference LoRA to use **alongside the same checkpoint and original adapters
   at the recorded weights**.
 
-This is an additive adapter, not a merged replacement for the original LoRA.
-Only the preference adapter is disabled for reference inference; a second SDXL
+Internally training uses an additive preference adapter. Completed runs that
+start with LoRAs also export `combined_DPO_stepNNNNNN.safetensors` beside the run's
+checkpoints: a standalone inference LoRA containing the originals plus the DPO
+adjustment at their recorded weights. Load the combined file **instead of** the
+original and delta LoRAs, on the same base checkpoint, at weight 1. The original
+files stay untouched. Checkpoint-only training already produces a usable standalone
+preference LoRA. Only the preference adapter is disabled for reference inference; a second SDXL
 copy is not resident on the GPU. Text encoders and VAE are frozen. The UNet uses
 bf16, native SDPA and gradient checkpointing; trainable adapter weights and AdamW
 states use fp32. The VAE retains checkpoint precision and runs in fp32. Text
@@ -42,6 +47,11 @@ see [PyTorch reproducibility](https://docs.pytorch.org/docs/stable/notes/randomn
    prompt, model and sampling settings; its two images use different seeds. A/B
    assignment is reproducible. Later batches advance the seed by twice the
    existing comparison count, so clicking Generate again collects fresh pairs.
+   Use **Add prompt** to add a positive/negative textbox pair and its own number
+   of comparisons, or **Remove prompt** to remove it before generation. For
+   example, 20 pairs for one prompt and 5 for another generates 25 comparisons
+   (50 images). A multiline positive textbox is one prompt. Blank positive rows
+   must be filled or removed; an empty negative is allowed.
 4. In Rate, choose A/B slightly or strongly preferred, a tie, or no preference.
    Quality A and B are independent: excellent, good, acceptable, bad, especially
    bad, or unrated. Add optional reasons. **Save** or **Save & Next** commits a
@@ -61,6 +71,43 @@ Advanced options, including holdout fraction, token length and strength weights,
 can be set in JSON and survive a GUI save. The default original/preference
 adapter weight is 1. Training a loaded preference adapter requires weight 1;
 other preference weights are for inference only.
+
+### Exporting a combined LoRA
+
+**Export combined LoRA...** lets you choose an existing `preference_lora.safetensors`
+checkpoint and a new output filename. It uses the original stack and weights from
+the current config; the preference checkpoint's reference identity must match.
+The preference adjustment is included at weight 1. Export runs on CPU and uses
+factor concatenation: it retains every supported text, convolution and normalization
+delta, without SVD rank reduction. The output uses fp32 and can be significantly
+larger than the original. It represents the same additive policy mathematically;
+runtime rounding and differences between inference engines can change pixels.
+
+Supported exports are plain LoRA/LoCon (linear or 1x1-up convolution factors) and
+additive norm deltas. DoRA, LoCon mid factors and other algorithms are rejected,
+never partially loaded. Output files are never overwritten. If an automatic
+export is unsupported or cannot be written, training checkpoints remain usable
+and the error is recorded in `status.json`. Stop requests during export are checked
+between modules and before publishing the completed file.
+
+For further DPO resume, use the separate checkpoint and its original reference
+stack; a combined export is an inference artifact, not the resumable delta. You
+can use it as the starting original LoRA for a new round with a new dataset.
+
+```powershell
+& .\backend\sd_scripts\venv\Scripts\python.exe -m backend.preference.cli combine `
+    --config preference.local.json --preference path/to/preference_lora.safetensors `
+    --output path/to/character_DPO.safetensors
+```
+
+Per-prompt configuration uses `generation.prompts` entries of the form
+`{"prompt": "...", "negative_prompt": "...", "pairs": 20}`. Legacy string entries
+still inherit `generation.negative_prompt` and `generation.pairs_per_prompt`.
+Explicit empty negatives override that legacy default. GUI saves write explicit
+objects. Prompt grouping still uses positive text, so using another negative for
+the same positive cannot move that prompt into a different validation split.
+Negative prompts guide generation and are recorded in pair/PNG metadata; current
+Diffusion-DPO training conditions on the positive text only.
 
 Equivalent CLI commands (PowerShell, from the frontend checkout):
 
@@ -111,6 +158,77 @@ multiresolution noise or supervised-loss mixing is added to this objective.
 Defaults (rank/alpha 16, AdamW LR 1e-5, beta 5000, accumulation 4) are starting
 parameters, not validated quality recommendations. The original supervised
 LoCon's rank, optimizer, batch size and learning rate are not copied to DPO.
+
+## Practical evaluation and data collection
+
+The pair count needed for useful personal preference tuning has not been
+established for this implementation. The original Diffusion-DPO experiment used
+851,293 non-tied pairs and 58,960 prompts, a different scale and training setup;
+its results do not validate a small personal LoRA dataset. See
+[the paper's experimental setting](https://arxiv.org/html/2311.12908v1#S5.SS1).
+
+As an engineering starting point, use a handful of pairs to check execution,
+50-100 eligible pairs to seek an early narrow signal, and roughly 250-500 eligible
+pairs across 30-50 meaningfully different prompts for a first serious character
+experiment. These are trial budgets, not evidence-based minimums or guarantees.
+Collect more generations than the desired eligible count because ties/skips are
+excluded. For broader style/quality preferences, expect substantially more data
+and broader subject/style coverage; expand only after a held-out benefit appears.
+
+For a character, vary poses, camera distance, expressions, outfits, lighting,
+backgrounds and requested styles. Repeating one prompt hundreds of times does
+not test generalization. Choose winners consistently: if closeups always win
+over full-body compositions, a closeup bias may be learned alongside any improved
+character details. Negative prompts should reflect intended use. If both images
+are bad, a relative winner is valid, but it does not teach an absolute quality
+threshold; tie/skip when there is no useful preference.
+
+Hold out whole prompt groups (the default grouping does this), inspect actual
+train/validation counts, and also compare fresh generations on prompts/seeds
+not used to select checkpoints. Include unrelated subjects to detect unwanted
+effects: an active preference LoRA is not automatically gated to a trigger word.
+The frozen reference anchors learning but does not guarantee that the adapted
+model preserves diversity or improves on unseen prompts.
+
+Compare baseline versus adapted inference with identical checkpoint, prompt,
+negative, seed, dimensions, sampler, sampling steps, CFG and inference engine.
+For the delta file, baseline is the original stack and treatment is that same
+stack plus `preference_lora:1`; alternatively replace the original stack with
+the combined export at weight 1. Review several prompts/seeds, preferably with
+blinded A/B identities. An image-quality win is the acceptance criterion; a lower
+training loss or perfect denoising preference accuracy on a tiny holdout is not
+sufficient. Current validation ranks recorded pairs at fixed noise/timestep
+draws; it does not generate new validation images automatically.
+
+An optimizer step samples `gradient_accumulation` pairs with replacement. The
+expected presentations per training pair are approximately
+`max_steps * gradient_accumulation / train_pair_count`. With 50 steps,
+accumulation 4 and two training pairs, that is about 100 presentations per pair,
+with newly sampled noise/timesteps, rather than 200 independent examples. Keep
+early runs short and compare intermediate checkpoints before increasing steps.
+
+## Advanced configuration roadmap
+
+The DPO path currently fixes AdamW (weight decay 0), constant learning rate,
+unit gradient clipping, uniform diffusion timestep sampling, squared denoising
+error and the sigmoid DPO objective. Rank, alpha, learning rate, beta, accumulation
+and checkpoint frequency are configurable. Quality labels and reason text are
+recorded only; explicit A/B choices and strength weights supply the loss signal.
+
+After a quality benefit is demonstrated, the next integration targets are the
+trainer's optimizer and learning-rate scheduler factories, warmup and optimizer
+arguments, with checkpoint/resume support for their state. Memory and gradient
+controls can follow. The inference sampler, training noise schedule and learning
+rate schedule are distinct settings and should be labelled separately.
+
+Alternative L1/Huber denoising losses, SNR weighting and different preference
+objectives require their own validation. Replacing the squared Gaussian
+denoising error changes the standard Diffusion-DPO surrogate. They should be
+explicit experimental modes rather than ordinary-training controls that appear
+to work but are ignored. Beta is also not a simple strength slider: it affects
+reference regularization and gradient scaling, so tune it jointly with learning
+rate using held-out results. The paper discusses this interaction in
+[its hyperparameters and beta ablation](https://arxiv.org/html/2311.12908v1#S5.SS1).
 
 ## Replay, validation and resume
 

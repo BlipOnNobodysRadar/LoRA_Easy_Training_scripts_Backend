@@ -11,14 +11,15 @@ import torch
 from safetensors import safe_open
 from PIL.PngImagePlugin import PngInfo
 
-from .config import atomic_json, file_identity, model_identity, split_for_prompt, utc_now
+from .config import atomic_json, file_identity, model_identity, prompt_entries, split_for_prompt, utc_now
 from .sdxl import SDXLModel, Cancelled
 from .store import PreferenceStore
 
 
 def generate(config, cancelled=lambda: False):
     settings = config["generation"]
-    if not settings["prompts"]:
+    entries = prompt_entries(settings)
+    if not entries:
         raise ValueError("Add at least one generation prompt")
     store = PreferenceStore(config["dataset_dir"])
     existing_groups = {}
@@ -45,24 +46,28 @@ def generate(config, cancelled=lambda: False):
     manifest = {"id": session, "created_at": utc_now(), "config": config,
                 "model": model.identity, "pairs": [], "status": "running"}
     atomic_json(session_path, manifest)
-    total = len(settings["prompts"]) * settings["pairs_per_prompt"]
+    total = sum(entry["pairs"] for entry in entries)
+    pair_number = 0
     torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
     try:
-        for prompt_index, prompt in enumerate(settings["prompts"]):
+        for prompt_index, entry in enumerate(entries):
+            prompt, negative = entry["prompt"], entry["negative_prompt"]
+            pair_settings = {key: value for key, value in settings.items() if key != "prompts"}
+            pair_settings.update(negative_prompt=negative, pairs_per_prompt=entry["pairs"])
             group, split = split_for_prompt(prompt, settings["validation_fraction"], settings["split_seed"])
             split = existing_groups.get(group, split)
-            for pair_index in range(settings["pairs_per_prompt"]):
+            for pair_index in range(entry["pairs"]):
                 if cancelled():
                     raise Cancelled()
-                pair_number = prompt_index * settings["pairs_per_prompt"] + pair_index
                 pair_id = uuid4().hex
                 print(f"Comparison {pair_number + 1}/{total}: {prompt}", flush=True)
                 record = {"id": pair_id, "created_at": utc_now(), "session_id": session,
                           "group_id": group, "split": split, "synthetic": config["training"]["allow_synthetic"],
-                          "prompt": prompt, "negative_prompt": settings["negative_prompt"],
+                          "prompt": prompt, "negative_prompt": negative,
                           "model": model.identity, "images": [],
-                          "generation_settings": {**settings, "engine": "native-sdxl-sdpa-v1",
+                          "generation_settings": {**pair_settings, "engine": "native-sdxl-sdpa-v1",
+                              "prompt_index": prompt_index, "pair_index": pair_index,
                               "batch_seed": batch_seed,
                               "torch": torch.__version__, "diffusers": diffusers.__version__,
                               "python": platform.python_version(), "gpu": torch.cuda.get_device_name(),
@@ -73,14 +78,14 @@ def generate(config, cancelled=lambda: False):
                 if int(hashlib.sha256(f"{batch_seed}:{pair_number}:order".encode()).hexdigest()[:2], 16) % 2:
                     seeds.reverse()
                 for side, seed in zip(("a", "b"), seeds):
-                    image, scheduler_config = model.generate(prompt, settings["negative_prompt"], settings, seed, cancelled)
+                    image, scheduler_config = model.generate(prompt, negative, pair_settings, seed, cancelled)
                     record["generation_settings"]["scheduler_config"] = scheduler_config
                     relative = f"images/{pair_id}-{side}.png"
                     image_path = store.root / relative
                     image_path.parent.mkdir(parents=True, exist_ok=True)
                     metadata = PngInfo()
                     metadata.add_text("preference_generation", json.dumps({
-                        "prompt": prompt, "negative_prompt": settings["negative_prompt"], "seed": seed,
+                        "prompt": prompt, "negative_prompt": negative, "seed": seed,
                         "model": model.identity, "settings": record["generation_settings"]}))
                     with image_path.open("xb") as handle:
                         image.save(handle, format="PNG", pnginfo=metadata)
@@ -89,6 +94,7 @@ def generate(config, cancelled=lambda: False):
                 store.add_comparison(record)
                 manifest["pairs"].append(pair_id)
                 atomic_json(session_path, manifest)
+                pair_number += 1
         manifest["status"] = "completed"
     except Cancelled:
         manifest["status"] = "stopped"

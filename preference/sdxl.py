@@ -114,6 +114,8 @@ class SDXLModel:
         if path:
             with safe_open(path, framework="pt", device="cpu") as file:
                 metadata = file.metadata() or {}
+            if metadata.get("preference_export_type") == "combined":
+                raise ValueError("This is a combined inference LoRA. Use it as an original LoRA, or select the separate preference_lora checkpoint to resume DPO.")
             if metadata.get("preference_reference_id") != self.identity["reference_id"]:
                 raise ValueError("Preference adapter was trained against a different or unspecified reference")
             if trainable and (float(metadata["ss_network_dim"]) != rank or
