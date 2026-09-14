@@ -251,7 +251,8 @@ class SDXLModel:
         self.vae.to("cpu")
         del pixels, latents
         torch.cuda.empty_cache()
-        return Image.fromarray((array * 255).round().astype(np.uint8)), dict(scheduler.config)
+        from .config import scheduler_metadata
+        return Image.fromarray((array * 255).round().astype(np.uint8)), scheduler_metadata(dict(scheduler.config))
 
     def save_preference(self, path, rank, alpha, extra_metadata=None):
         if self.preference is None:

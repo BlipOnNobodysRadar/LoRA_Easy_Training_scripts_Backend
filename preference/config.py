@@ -31,6 +31,24 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def scheduler_metadata(value):
+    """Serialize scheduler limits as strings; never change the live scheduler.
+
+    DPM++ uses -inf for lambda_min_clipped. JSON snapshots and fingerprints
+    require finite numbers, so preserve that sentinel explicitly as text.
+    NaN is not a valid limit and remains an error.
+    """
+    if isinstance(value, dict):
+        return {key: scheduler_metadata(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scheduler_metadata(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            raise ValueError("NaN in scheduler metadata")
+        return "Infinity" if value > 0 else "-Infinity"
+    return value
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

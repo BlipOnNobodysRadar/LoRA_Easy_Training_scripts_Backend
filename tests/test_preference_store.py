@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,6 +71,32 @@ class StoreTestCase(unittest.TestCase):
         return fb
 
     # -- tests -----------------------------------------------------------
+    def test_dpm_scheduler_metadata_supports_strict_json_and_legacy_rows(self):
+        record = self._record(generation_settings={
+            "sampler": "dpmpp_2m", "scheduler_config": {
+                "lambda_min_clipped": float("-inf"), "solver_order": 2}})
+        self.store.add_comparison(record)
+        self.store.put_feedback("c1", self._feedback())
+        self.assertEqual(record["generation_settings"]["scheduler_config"]["lambda_min_clipped"], float("-inf"))
+        current = self.store.get("c1")
+        json.dumps(current, allow_nan=False)
+        self.assertEqual(current["generation_settings"]["scheduler_config"]["lambda_min_clipped"], "-Infinity")
+        # Emulate a dataset saved before the fix, including its original bytes.
+        legacy = json.dumps(record)
+        with closing(self.store._connect()) as conn:
+            conn.execute("UPDATE comparisons SET record = ? WHERE comparison_id = 'c1'", (legacy,))
+        self.assertEqual(self.store.get("c1"), current)
+        self.assertEqual(self.store.list_comparisons(status="eligible"), [current])
+        self.store.export_jsonl(self.root / "export.jsonl")
+        json.loads((self.root / "export.jsonl").read_text(), parse_constant=lambda token: self.fail(token))
+        with closing(self.store._connect()) as conn:
+            self.assertEqual(conn.execute("SELECT record FROM comparisons").fetchone()[0], legacy)
+
+    def test_scheduler_nan_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "NaN"):
+            self.store.add_comparison(self._record(generation_settings={
+                "scheduler_config": {"limit": float("nan")}}))
+
     def test_root_created_and_absolute(self):
         self.assertTrue(self.store.root.is_absolute())
         self.assertTrue((self.root / "preferences.sqlite3").exists())

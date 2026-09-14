@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from .config import scheduler_metadata
+
 DB_FILENAME = "preferences.sqlite3"
 
 PREFERENCES = ("a", "b", "tie", "skip", "unrated")
@@ -42,6 +44,15 @@ CREATE INDEX IF NOT EXISTS idx_feedback_cid ON feedback(comparison_id);
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_record(record):
+    # Accept old DPM++ records without rewriting their immutable database rows.
+    settings = record.get("generation_settings") if isinstance(record, dict) else None
+    if isinstance(settings, dict) and "scheduler_config" in settings:
+        return {**record, "generation_settings": {
+            **settings, "scheduler_config": scheduler_metadata(settings["scheduler_config"])}}
+    return record
 
 
 def _validate_utc(value: object, field: str) -> str:
@@ -180,9 +191,10 @@ class PreferenceStore:
 
     # -- public API ------------------------------------------------------
     def add_comparison(self, record: dict) -> str:
+        record = _normalize_record(record)
         self._validate_record(record)
         cid = record["id"]
-        payload = json.dumps(record, sort_keys=True)
+        payload = json.dumps(record, sort_keys=True, allow_nan=False)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -220,7 +232,7 @@ class PreferenceStore:
             ).fetchone()
             if row is None:
                 raise KeyError(comparison_id)
-            record = json.loads(row["record"])
+            record = _normalize_record(json.loads(row["record"]))
             record["feedback"] = self._current_feedback(conn, comparison_id)
         finally:
             conn.close()
@@ -238,7 +250,7 @@ class PreferenceStore:
             ).fetchall()
             results = []
             for row in rows:
-                record = json.loads(row["record"])
+                record = _normalize_record(json.loads(row["record"]))
                 if split is not None and record.get("split") != split:
                     continue
                 feedback = self._current_feedback(conn, row["comparison_id"])
@@ -340,9 +352,9 @@ class PreferenceStore:
             ).fetchall()
             lines = []
             for row in rows:
-                record = json.loads(row["record"])
+                record = _normalize_record(json.loads(row["record"]))
                 record["feedback"] = self._current_feedback(conn, row["comparison_id"])
-                lines.append(json.dumps(record, sort_keys=True))
+                lines.append(json.dumps(record, sort_keys=True, allow_nan=False))
         finally:
             conn.close()
         tmp = target.with_name(target.name + "." + uuid4().hex + ".tmp")
