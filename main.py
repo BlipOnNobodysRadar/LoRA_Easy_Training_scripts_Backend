@@ -216,7 +216,12 @@ async def start_training(request: Request) -> JSONResponse:
             f"--dataset_config={dataset.resolve()}",
         ]
 
-    app.state.TRAINING_THREAD = subprocess.Popen(cmd)
+    from preference.jobs import launch_exclusive, Timeout
+    try:
+        app.state.TRAINING_THREAD = launch_exclusive(cmd)
+    except Timeout:
+        return JSONResponse({"detail": "A training or preference job is already running"},
+                            status_code=status.HTTP_409_CONFLICT)
     if (
         "kill_tunnel_on_train_start" in server_config_dict
         and server_config_dict["kill_tunnel_on_train_start"]

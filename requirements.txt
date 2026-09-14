@@ -5,3 +5,4 @@ pyngrok~=8.1.2
 pycloudflared~=0.3.0
 wheel~=0.47.0
 urllib3>=2.7.0
+filelock>=3.18,<4
