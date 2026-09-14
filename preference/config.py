@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -57,7 +58,19 @@ def atomic_json(path, value):
         json.dump(value, handle, indent=2, ensure_ascii=False, allow_nan=False)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temp, path)
+    try:
+        # Windows readers/antivirus may briefly deny deletion of the destination.
+        # Keep replacement atomic; a transient status reader must not abort training.
+        for attempt in range(7):
+            try:
+                os.replace(temp, path)
+                break
+            except PermissionError:
+                if attempt == 6:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def file_identity(path):
