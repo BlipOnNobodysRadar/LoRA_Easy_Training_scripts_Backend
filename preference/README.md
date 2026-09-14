@@ -1,8 +1,113 @@
-# SDXL preference collection and Diffusion-DPO
+# SDXL preferences, aligned edits, and concept training
 
 Experimental, local, single-GPU preference training. Ordinary supervised training
 keeps its existing configuration and code path. This subsystem trains a **separate
 UNet LoRA**, leaving the input checkpoint and any starting adapters untouched.
+
+## Selectable objectives
+
+Choose **Adaptation objective** in Configuration. All methods train the separate
+UNet adapter, support checkpoint/resume, and export the original adapter stack
+plus the learned adjustment as one inference LoRA. DPO remains the default;
+existing DPO configs and resume signatures retain their previous meaning.
+
+| Method | Data and practical purpose |
+| --- | --- |
+| Diffusion-DPO | Rated winner/loser pairs; moves relative denoising errors toward the preferred image compared with the frozen reference. |
+| ADDifT (aligned image edits) | Explicitly imported, aligned before/after images with a human winner; learns the illustrated visual change. |
+| LECO (text concept) | Prompt-defined concept direction; no images or ratings required. |
+
+Quality labels and reason tags are review metadata, **not additional losses**.
+DPO and ADDifT use preference strength (slight 0.5, normal 1, strong 2 by default).
+LECO does not use pair feedback. No arbitrary mixture of these losses is enabled:
+their scales and sampling distributions differ. To combine methods, start a new
+run using a previous adjustment as the optional trainable adapter (same frozen
+reference), or use the exported combined LoRA as a new frozen starting adapter.
+Clear Resume when changing method. New image datasets must match the reference.
+
+### Aligned image import and ADDifT
+
+Choose a separate Dataset directory for aligned edits. **Import aligned edit...**
+accepts an original image, its edited counterpart, the shared scene prompt, and
+an optional negative prompt. The files must have matching dimensions (multiples
+of 64, 256–1536); the importer does not resize or realign them. Copies are hashed
+and stored immutably. A is the original, B is the edit. Review each pair in Rate;
+an ADetailer/inpainting result is not automatically the winner. Ties and skips do
+not train. Alignment is your declaration, not something this importer proves.
+
+Bulk import accepts a JSON list, with paths relative to the manifest:
+
+```json
+[
+  {"source": "before/001.png", "target": "after/001.png", "aligned": true,
+   "prompt": "a ceramic mug on a table", "negative_prompt": "blur", "seed": 123}
+]
+```
+
+```powershell
+backend\sd_scripts\venv\Scripts\python.exe -m backend.preference.cli import-pairs --config preference.local.json --manifest edits.json
+```
+
+Import is idempotent for the same reference/files/prompt, leaves source files
+untouched, and preserves existing prompt-group holdouts. Omit seed when unknown;
+original sampler settings for an external image are not invented. The current
+reference is recorded as the model being adapted, not proof of external-image
+generation provenance. Imported pairs can also train with DPO. Do not overwrite
+images already in a collected dataset.
+
+This **ADDifT-style SDXL variant** uses the VAE posterior mean, shared diffusion
+noise and timesteps, default interval [400, 900), and MSE between:
+
+```text
+student: adapter +1, noisy preferred-image latent
+teacher: adapter  0, noisy rejected-image latent
+```
+
+Both predictions use the same positive scene prompt. Optional alternate inverse
+direction swaps the two latents and trains at adapter -1 on alternating optimizer
+steps. Backward retains that sign during gradient-checkpoint recomputation. The
+saved adapter is calibrated at strength 1. This follows the paired prediction
+matching idea in [TrainTrain](https://github.com/hako-mikan/sd-webui-traintrain),
+with explicit unit-strength training, deterministic VAE means, uniform timesteps,
+and our existing frozen-reference/resume machinery. It is not a numerical port
+of TrainTrain's quarter-strength and timestep schedule. An analytic Gaussian
+denoiser test verifies the positive edit direction for both alternating signs.
+
+Whole-image loss is currently used: no edit-mask loss, crop loss, automatic
+quality label conversion, or guaranteed feature disentanglement. Small facial
+edits may provide a weak signal relative to the rest of the image. Preference
+for edits is viable, but evaluate fresh raw generations without ADetailer.
+
+### LECO prompt settings
+
+This mode reuses the bundled sd-scripts `PromptSettings.build_target` formula:
+
+```text
+enhance: desired prediction = neutral + strength * (concept - contrast)
+erase:   desired prediction = neutral - strength * (concept - contrast)
+```
+
+All three predictions come from the frozen reference at the same latent/timestep.
+The trainable adapter learns that prediction under **Prompt to change**. Latents
+come from a randomly truncated reference DDIM trajectory using the configured
+resolution, Partial sampling steps (default 20) and CFG (default 3). This uses
+the [sd-scripts LECO objective](https://github.com/kohya-ss/sd-scripts/blob/main/docs/train_leco.md)
+with reference-only DDIM trajectory sampling, rather than that trainer's policy
+DDPM sampling. It supports the existing frozen adapter stack and stop/resume.
+This is a deliberately identified sampling variant, not a reproduction claim.
+
+For a simple red-to-blue mug experiment: set Prompt to change, Neutral, and
+Contrast to `an illustration of a red ceramic mug`; set Concept to
+`an illustration of a blue ceramic mug`; choose Enhance, strength 1. This makes
+the target prediction exactly the reference's blue-mug prediction. Keep
+generation width/height at 512 for an inexpensive execution experiment, then
+evaluate at the resolution you actually use. Ordinary generation prompts,
+negative prompts, sampling steps and sampler do not configure LECO's concept
+loss. DPO beta is disabled in the UI for both edit methods.
+
+LECO training loss measures matching its text-defined teacher. It supplies no
+held-out image preference accuracy and no automatic quality assessment. Test
+unseen seeds, scenes, and objects at adapter strengths -1, 0 and +1.
 
 ## Two starting points
 
@@ -15,7 +120,7 @@ UNet LoRA**, leaving the input checkpoint and any starting adapters untouched.
   at the recorded weights**.
 
 Internally training uses an additive preference adapter. Completed runs that
-start with LoRAs also export `combined_DPO_stepNNNNNN.safetensors` beside the run's
+start with LoRAs also export `combined_METHOD_stepNNNNNN.safetensors` beside the run's
 checkpoints: a standalone inference LoRA containing the originals plus the DPO
 adjustment at their recorded weights. Load the combined file **instead of** the
 original and delta LoRAs, on the same base checkpoint, at weight 1. The original
@@ -270,7 +375,30 @@ Validation reports fixed-noise held-out DPO loss and preference accuracy. A
 falling training loss or a synthetic smoke-test pass does not demonstrate better
 images. Judge improvement with fresh human comparisons on unseen prompts.
 
-## Scope and implementation boundaries
+## Other research and scope
+
+[LoFA](https://github.com/GAP-LAB-CUHK-SZ/LoFA) now publishes code, but its released
+preview checkpoint targets MotionX action video with explicitly limited
+generalization. Its identity-personalized image checkpoint is still listed as
+unreleased (checked 2026-09-14). Fast prediction comes after training a suitable
+hypernetwork. This subsystem does not implement LoFA or train an SDXL predictor.
+
+[LoRA.rar](https://github.com/donaldssh/LoRA.rar) does provide a pretrained SDXL
+hypernetwork. It predicts merging coefficients for existing subject/style
+adapters, rather than predicting a new identity adapter from examples. Its
+released implementation predicts coefficients for attention Q/output projections
+and adds K/V normally; it is not an arbitrary feature filter for a full
+LoCon/normalization adapter. Its repository license is CC BY-NC-SA 4.0. Neither
+its code nor its weights are bundled here. A separate compatibility experiment
+would need to account for every original tensor and evaluate preservation and
+style transfer. There is no LoFA/LoRA.rar checkbox that silently does nothing.
+
+Learning a gloss slider and suppressing it in a style adapter may help, but a
+direction is not guaranteed orthogonal to identity, anatomy or other style
+features. Preventing those features from being learned needs matched examples
+and preservation evaluation; predicting weights faster does not solve this.
+
+## Implementation boundaries
 
 Supported: standard epsilon-prediction, four-channel SDXL base checkpoints;
 native sd-scripts LoRA and LyCORIS LoRA/LoCon, including text encoder weights

@@ -139,6 +139,8 @@ def load_config(path):
         raise ValueError("allow_synthetic must be true or false")
     if type(t["deterministic"]) is not bool:
         raise ValueError("deterministic must be true or false")
+    from .methods import method_settings
+    method_settings(t)
     return cfg
 
 

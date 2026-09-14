@@ -198,13 +198,14 @@ class SDXLModel:
             return self.unet(latents.to(self.dtype), timesteps, text.to(self.dtype), vector.to(self.dtype))
 
     @torch.no_grad()
-    def encode_image(self, path, seed):
+    def encode_image(self, path, seed, posterior_mean=False):
         image = Image.open(path).convert("RGB")
         pixels = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
         pixels = torch.from_numpy(pixels).permute(2, 0, 1).unsqueeze(0).to(self.device)
         self.vae.to(self.device, dtype=torch.float32)
         generator = torch.Generator(device=self.device).manual_seed(seed)
-        latents = self.vae.encode(pixels).latent_dist.sample(generator=generator)
+        posterior = self.vae.encode(pixels).latent_dist
+        latents = posterior.mean if posterior_mean else posterior.sample(generator=generator)
         latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
         self.vae.to("cpu")
         if not torch.isfinite(latents).all():

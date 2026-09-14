@@ -17,6 +17,8 @@ from .config import atomic_json, file_identity, utc_now, prompt_group
 from .loss import diffusion_dpo_loss
 from .sdxl import SDXLModel, noise_scheduler, Cancelled
 from .store import PreferenceStore
+from .methods import method_settings, signature_settings
+from .objectives import objective_loss, leco_inputs, set_multiplier
 
 
 def digest(value):
@@ -27,7 +29,7 @@ def micro_seed(seed, step, micro):
     return int(hashlib.sha256(f"{seed}:{step}:{micro}".encode()).hexdigest()[:15], 16)
 
 
-def eligible_records(store, reference_id, allow_synthetic):
+def eligible_records(store, reference_id, allow_synthetic, objective="dpo"):
     rows = store.list_comparisons(status="eligible")
     rows = [r for r in rows if allow_synthetic or not r.get("synthetic", False)]
     if not rows:
@@ -35,6 +37,8 @@ def eligible_records(store, reference_id, allow_synthetic):
     if len({bool(r.get("synthetic", False)) for r in rows}) != 1:
         raise ValueError("Synthetic tests and real preferences must be in separate datasets")
     for row in rows:
+        if objective == "addift" and row.get("pair_kind") != "aligned_edit_v1":
+            raise ValueError("ADDifT needs explicitly imported aligned edits. Use a separate dataset; ordinary A/B generations are not aligned.")
         if row["group_id"] != prompt_group(row["prompt"]):
             raise ValueError("Prompt group identity is invalid; refusing possible validation leakage")
         if row["model"].get("reference_id") != reference_id:
@@ -60,7 +64,7 @@ def eligible_records(store, reference_id, allow_synthetic):
     return rows
 
 
-def cache_pairs(model, store, rows, seed, cancelled):
+def cache_pairs(model, store, rows, seed, cancelled, posterior_mean=False):
     cached = {}
     for index, row in enumerate(rows):
         if cancelled():
@@ -68,7 +72,8 @@ def cache_pairs(model, store, rows, seed, cancelled):
         images = {image["id"]: image for image in row["images"]}
         winner = row["feedback"]["preference"]
         ordered = [images[winner], images["b" if winner == "a" else "a"]]
-        latent_list = [model.encode_image(store.root / image["path"], micro_seed(seed, image["sha256"], 0))
+        extra = {"posterior_mean": True} if posterior_mean else {}
+        latent_list = [model.encode_image(store.root / image["path"], micro_seed(seed, image["sha256"], 0), **extra)
                        for image in ordered]
         settings = row["generation_settings"]
         text, vector = model.encode_prompt(row["prompt"], settings["width"], settings["height"])
@@ -77,10 +82,10 @@ def cache_pairs(model, store, rows, seed, cancelled):
     return cached
 
 
-def pair_inputs(cached, seed, model, scheduler):
+def pair_inputs(cached, seed, model, scheduler, min_timestep=0, max_timestep=1000):
     generator = torch.Generator(device=model.device).manual_seed(seed)
     latents = cached["latents"].to(model.device).float()
-    timestep = torch.randint(0, scheduler.config.num_train_timesteps, (1,),
+    timestep = torch.randint(min_timestep, max_timestep, (1,),
                              generator=generator, device=model.device).repeat(2)
     # Different generation seeds are appropriate for collection. During training,
     # paired images must share this newly sampled diffusion noise and timestep.
@@ -100,13 +105,11 @@ def denoising_errors(model, inputs):
 @torch.no_grad()
 def evaluate(model, rows, cached, settings, scheduler):
     results = []
+    method, options = method_settings(settings)
+    limits = {k: options[k] for k in ("min_timestep", "max_timestep")} if method == "addift" else {}
     for row in rows:
-        inputs = pair_inputs(cached[row["id"]], micro_seed(settings["seed"], row["id"], "validation"), model, scheduler)
-        with model.reference_mode():
-            reference = denoising_errors(model, inputs)
-        policy = denoising_errors(model, inputs)
-        loss, metrics = diffusion_dpo_loss(policy, reference, settings["beta"],
-                                          [settings["strength_weights"][row["feedback"]["strength"]]])
+        inputs = pair_inputs(cached[row["id"]], micro_seed(settings["seed"], row["id"], "validation"), model, scheduler, **limits)
+        loss, metrics = objective_loss(model, inputs, settings, row)
         results.append({"loss": loss.item(), **metrics})
     return {key: sum(r[key] for r in results) / len(results) for key in results[0]} if results else None
 
@@ -118,8 +121,10 @@ def save_checkpoint(run_dir, step, model, optimizer, config, signature, metrics)
     temporary = run_dir / (".checkpoint-" + uuid4().hex)
     temporary.mkdir()
     settings = config["training"]
+    method, _ = method_settings(settings)
     model.save_preference(temporary / "preference_lora.safetensors", settings["rank"], settings["alpha"],
-                          {"ss_steps": str(step), "preference_synthetic_test": str(settings["allow_synthetic"]).lower()})
+                          {"ss_steps": str(step), "preference_synthetic_test": str(settings["allow_synthetic"]).lower(),
+                           "preference_objective": {"dpo": "diffusion-dpo-v1", "addift": "sdxl-aligned-addift-v1", "leco": "sdxl-leco-ddim-v1"}[method]})
     torch.save({"optimizer": optimizer.state_dict(), "step": step,
                 "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all()}, temporary / "training_state.pt")
     atomic_json(temporary / "state.json", {"schema_version": 1, "step": step,
@@ -132,6 +137,7 @@ def save_checkpoint(run_dir, step, model, optimizer, config, signature, metrics)
 
 def train(config, resume=None, cancelled=lambda: False):
     settings = config["training"]
+    method, options = method_settings(settings)
     if config["model"].get("preference_lora") and config["model"]["preference_weight"] != 1.0:
         raise ValueError("Training an existing preference adapter requires preference_weight=1; other weights are inference-only")
     if settings["deterministic"]:
@@ -147,10 +153,14 @@ def train(config, resume=None, cancelled=lambda: False):
     # Hash/model/data validation precedes GPU allocation.
     from .config import model_identity
     identity = model_identity(config["model"])
-    rows = eligible_records(store, identity["reference_id"], settings["allow_synthetic"])
+    if method == "leco":
+        rows = [{"id": digest(options), "split": "train", "prompt": options["target"],
+                 "synthetic": settings["allow_synthetic"], "feedback": {"strength": "normal"}}]
+    else:
+        rows = eligible_records(store, identity["reference_id"], settings["allow_synthetic"], method)
     training_rows = [r for r in rows if r["split"] == "train"]
     validation_rows = [r for r in rows if r["split"] == "validation"]
-    fixed_settings = {k: v for k, v in settings.items() if k not in ("max_steps", "checkpoint_every", "output_dir")}
+    fixed_settings = signature_settings(settings, config["generation"])
     signature = digest({"reference_id": identity["reference_id"], "settings": fixed_settings, "data": rows})
     if resume:
         checkpoint = Path(resume).resolve(strict=True)
@@ -186,10 +196,17 @@ def train(config, resume=None, cancelled=lambda: False):
         optimizer.load_state_dict(saved["optimizer"])
         torch.set_rng_state(saved["torch_rng"])
         torch.cuda.set_rng_state_all(saved["cuda_rng"])
-    cached = cache_pairs(model, store, rows, settings["seed"], cancelled)
+    cached = {} if method == "leco" else cache_pairs(model, store, rows, settings["seed"], cancelled, method == "addift")
     scheduler = noise_scheduler()
+    limits = {k: options[k] for k in ("min_timestep", "max_timestep")} if method == "addift" else {}
+
+    def inputs_for(row, seed):
+        if method == "leco":
+            return leco_inputs(model, settings, config["generation"], seed, cancelled)
+        return pair_inputs(cached[row["id"]], seed, model, scheduler, **limits)
+
     # Frozen reference and initial policy must agree for a newly initialized delta.
-    probe_inputs = pair_inputs(cached[training_rows[0]["id"]], 1729, model, scheduler)
+    probe_inputs = inputs_for(training_rows[0], 1729)
     with model.reference_mode():
         reference_probe = model.predict(*probe_inputs[:4]).detach().clone()
     with torch.no_grad():
@@ -214,17 +231,21 @@ def train(config, resume=None, cancelled=lambda: False):
             for micro in range(settings["gradient_accumulation"]):
                 seed = micro_seed(settings["seed"], step, micro)
                 row = training_rows[random.Random(seed).randrange(len(training_rows))]
-                inputs = pair_inputs(cached[row["id"]], seed, model, scheduler)
-                with model.reference_mode():
-                    reference_errors = denoising_errors(model, inputs)
-                inputs[0].requires_grad_(True)  # native reentrant gradient checkpointing needs a grad input
-                policy_errors = denoising_errors(model, inputs)
-                loss, pair_metrics = diffusion_dpo_loss(policy_errors, reference_errors, settings["beta"],
-                                                       [settings["strength_weights"][row["feedback"]["strength"]]])
+                try:
+                    inputs = inputs_for(row, seed)
+                except Cancelled:
+                    status = "stopped"
+                    break
+                loss, pair_metrics = objective_loss(model, inputs, settings, row, step)
                 (loss / settings["gradient_accumulation"]).backward()
+                set_multiplier(model, 1.0)
                 losses.append(loss.item())
                 per_micro.append(pair_metrics)
-                del inputs, policy_errors, reference_errors, loss
+                del inputs, loss
+            if status == "stopped":
+                optimizer.zero_grad(set_to_none=True)
+                set_multiplier(model, 1.0)
+                break
             model.assert_gradient_ownership()
             grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True).item()
             if not math.isfinite(grad_norm) or (step == start_step and grad_norm == 0):
@@ -264,14 +285,15 @@ def train(config, resume=None, cancelled=lambda: False):
         report = {"status": status, "run_dir": str(run_dir), "step": final_step,
                   "checkpoint": str(checkpoint_path) if checkpoint_path else None,
                   "parameters_changed": changed, "frozen_gradient_check": True,
-                  "train_pairs": len(training_rows), "validation_pairs": len(validation_rows),
+                  "objective": method, "train_pairs": len(training_rows) if method != "leco" else 0,
+                  "validation_pairs": len(validation_rows), "concept_prompts": 1 if method == "leco" else 0,
                   "synthetic": bool(training_rows[0].get("synthetic")),
                   "adapter_reports": model.adapter_reports, **metrics}
         if status == "completed" and checkpoint_path and config["model"]["base_loras"]:
             from .combined import export_combined
             try:
                 report.update(export_combined(config, checkpoint_path / "preference_lora.safetensors",
-                              run_dir / f"combined_DPO_step{final_step:06d}.safetensors", cancelled))
+                              run_dir / f"combined_{method.upper()}_step{final_step:06d}.safetensors", cancelled))
             except (ValueError, OSError) as error:
                 # An unsupported export must not invalidate a saved/resumable run.
                 report["combined_export_error"] = str(error)

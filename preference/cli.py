@@ -18,6 +18,10 @@ def main(argv=None):
         if name == "train":
             command.add_argument("--resume", type=Path)
     inspect = sub.add_parser("status")
+    imported = sub.add_parser("import-pairs", help="Copy aligned before/after images for human review")
+    imported.add_argument("--config", required=True, type=Path)
+    imported.add_argument("--manifest", required=True, type=Path)
+    imported.add_argument("--stop-file", type=Path)
     inspect.add_argument("--dataset", required=True, type=Path)
     export = sub.add_parser("export")
     export.add_argument("--dataset", required=True, type=Path)
@@ -39,6 +43,10 @@ def main(argv=None):
     cancelled = lambda: bool(args.stop_file and args.stop_file.exists())
     if cancelled():
         print("Stop file already exists; no job started. Use a new stop-file path.")
+        return 0
+    if args.command == "import-pairs":
+        from .import_pairs import import_pairs
+        import_pairs(cfg, args.manifest)
         return 0
     if args.command == "combine":
         from .combined import export_combined
