@@ -172,6 +172,8 @@ def load_config(path):
         raise ValueError("deterministic must be true or false")
     from .methods import method_settings
     method_settings(t)
+    from .optimization import optimization_settings
+    optimization_settings(t)
     return cfg
 
 

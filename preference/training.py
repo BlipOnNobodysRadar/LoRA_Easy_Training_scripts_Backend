@@ -19,6 +19,7 @@ from .sdxl import SDXLModel, noise_scheduler, Cancelled
 from .store import PreferenceStore
 from .methods import method_settings, signature_settings
 from .objectives import objective_loss, leco_inputs, set_multiplier
+from .optimization import build_optimization
 
 
 def digest(value):
@@ -114,7 +115,25 @@ def evaluate(model, rows, cached, settings, scheduler):
     return {key: sum(r[key] for r in results) / len(results) for key in results[0]} if results else None
 
 
-def save_checkpoint(run_dir, step, model, optimizer, config, signature, metrics):
+def restore_optimization(optimizer, lr_scheduler, saved):
+    """Restore native state, including the custom optimizer's offloaded moments."""
+    if lr_scheduler is not None and saved.get("lr_scheduler") is None:
+        raise ValueError("Checkpoint is missing its learning-rate scheduler state")
+    optimizer.load_state_dict(saved["optimizer"])
+    if optimizer.__class__.__name__ == "SimplifiedAdEMAMixExM":
+        # Optimizer.load_state_dict casts floating states to the parameter's dtype
+        # and device. This optimizer deliberately keeps moments in separate storage.
+        device = torch.device(optimizer.state_storage_device)
+        for state in optimizer.state.values():
+            for key in ("exp_avg", "exp_avg_sq"):
+                if key in state:
+                    value = state[key].to(device=device, dtype=optimizer.state_storage_dtype)
+                    state[key] = value.pin_memory() if device.type == "cpu" else value
+    if lr_scheduler is not None:
+        lr_scheduler.load_state_dict(saved["lr_scheduler"])
+
+
+def save_checkpoint(run_dir, step, model, optimizer, config, signature, metrics, lr_scheduler=None):
     destination = run_dir / f"checkpoint-{step:06d}"
     if destination.exists():
         return destination
@@ -126,6 +145,7 @@ def save_checkpoint(run_dir, step, model, optimizer, config, signature, metrics)
                           {"ss_steps": str(step), "preference_synthetic_test": str(settings["allow_synthetic"]).lower(),
                            "preference_objective": {"dpo": "diffusion-dpo-v1", "addift": "sdxl-aligned-addift-v1", "leco": "sdxl-leco-ddim-v1"}[method]})
     torch.save({"optimizer": optimizer.state_dict(), "step": step,
+                "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
                 "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all()}, temporary / "training_state.pt")
     atomic_json(temporary / "state.json", {"schema_version": 1, "step": step,
                                          "signature": signature, "metrics": metrics, "saved_at": utc_now()})
@@ -188,12 +208,13 @@ def train(config, resume=None, cancelled=lambda: False):
     model.attach_preference(settings["rank"], settings["alpha"], path=adapter_path,
                             trainable=True, weight=1.0)
     parameters = list(model.preference.parameters())
-    optimizer = torch.optim.AdamW(parameters, lr=settings["learning_rate"], weight_decay=0.0)
+    optimizer, lr_scheduler, optimization = build_optimization(parameters, settings)
+    atomic_json(run_dir / "optimization.json", optimization)
     if resume:
         saved = torch.load(checkpoint / "training_state.pt", map_location="cpu", weights_only=True)
         if saved["step"] != start_step:
             raise ValueError("Checkpoint step mismatch")
-        optimizer.load_state_dict(saved["optimizer"])
+        restore_optimization(optimizer, lr_scheduler, saved)
         torch.set_rng_state(saved["torch_rng"])
         torch.cuda.set_rng_state_all(saved["cuda_rng"])
     cached = {} if method == "leco" else cache_pairs(model, store, rows, settings["seed"], cancelled, method == "addift")
@@ -247,16 +268,27 @@ def train(config, resume=None, cancelled=lambda: False):
                 set_multiplier(model, 1.0)
                 break
             model.assert_gradient_ownership()
-            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True).item()
+            # A zero limit disables clipping but still checks the gradient norm.
+            limit = optimization["max_grad_norm"] or math.inf
+            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, limit, error_if_nonfinite=True).item()
             if not math.isfinite(grad_norm) or (step == start_step and grad_norm == 0):
                 raise FloatingPointError("Preference gradients are zero or non-finite")
+            used_lr = float(optimizer.param_groups[0]["lr"])
             optimizer.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
             final_step = step + 1
             metrics = {"step": final_step, "loss": sum(losses) / len(losses), "gradient_norm": grad_norm,
+                       "learning_rate": used_lr, "next_learning_rate": float(optimizer.param_groups[0]["lr"]),
                        **{key: sum(r[key] for r in per_micro) / len(per_micro) for key in per_micro[0]},
                        "elapsed_seconds": time.monotonic() - started,
                        "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
                        "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30}
+            if hasattr(optimizer, "linear_hl_warmup_scheduler"):
+                group = optimizer.param_groups[0]
+                metrics["momentum_beta1"] = (optimizer.linear_hl_warmup_scheduler(
+                    final_step, group["betas"][0], group["min_beta1"], group["beta1_warmup"])
+                    if group["beta1_warmup"] else group["betas"][0])
             # Same noising inputs, adapter disabled: updates must not move reference.
             if final_step == start_step + 1 or final_step == settings["max_steps"]:
                 with model.reference_mode():
@@ -266,7 +298,7 @@ def train(config, resume=None, cancelled=lambda: False):
                     raise AssertionError("Frozen reference changed during preference training")
             if final_step % settings["checkpoint_every"] == 0 or final_step == settings["max_steps"]:
                 metrics["validation"] = evaluate(model, validation_rows, cached, settings, scheduler)
-                checkpoint_path = save_checkpoint(run_dir, final_step, model, optimizer, config, signature, metrics)
+                checkpoint_path = save_checkpoint(run_dir, final_step, model, optimizer, config, signature, metrics, lr_scheduler)
             with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(metrics, allow_nan=False) + "\n")
             atomic_json(run_dir / "status.json", {"status": "running", **metrics})
@@ -277,7 +309,7 @@ def train(config, resume=None, cancelled=lambda: False):
         raise
     else:
         if final_step > start_step:
-            checkpoint_path = save_checkpoint(run_dir, final_step, model, optimizer, config, signature, metrics)
+            checkpoint_path = save_checkpoint(run_dir, final_step, model, optimizer, config, signature, metrics, lr_scheduler)
         changed = any(not torch.equal(initial_parameters[name], p.detach().cpu())
                       for name, p in model.preference.named_parameters())
         if final_step > start_step and not changed:

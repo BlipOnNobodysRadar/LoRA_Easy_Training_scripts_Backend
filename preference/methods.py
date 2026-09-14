@@ -52,4 +52,9 @@ def signature_settings(training, generation):
         result.update(objective=method, **{method: values})
     if method == "leco":
         result["resolution"] = [generation["width"], generation["height"]]
+    if any(key in training for key in ("optimizer", "lr_schedule", "max_grad_norm")):
+        from .optimization import optimization_settings
+        for key in ("optimizer", "lr_schedule", "max_grad_norm"):
+            result.pop(key, None)
+        result["optimization"] = optimization_settings(training)
     return result

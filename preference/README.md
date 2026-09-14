@@ -127,8 +127,9 @@ original and delta LoRAs, on the same base checkpoint, at weight 1. The original
 files stay untouched. Checkpoint-only training already produces a usable standalone
 preference LoRA. Only the preference adapter is disabled for reference inference; a second SDXL
 copy is not resident on the GPU. Text encoders and VAE are frozen. The UNet uses
-bf16, native SDPA and gradient checkpointing; trainable adapter weights and AdamW
-states use fp32. The VAE retains checkpoint precision and runs in fp32. Text
+bf16, native SDPA and gradient checkpointing; trainable adapter weights use fp32.
+AdamW states use fp32; SimplifiedAdEMAMixExM uses its native configurable state
+storage (CPU bfloat16 by default). The VAE retains checkpoint precision and runs in fp32. Text
 encoders and the VAE move to the GPU only when needed; embeddings and sampled
 latents are cached in CPU memory for the run.
 
@@ -312,19 +313,52 @@ accumulation 4 and two training pairs, that is about 100 presentations per pair,
 with newly sampled noise/timesteps, rather than 200 independent examples. Keep
 early runs short and compare intermediate checkpoints before increasing steps.
 
-## Advanced configuration roadmap
+## Optimizer and learning-rate configuration
 
-The DPO path currently fixes AdamW (weight decay 0), constant learning rate,
-unit gradient clipping, uniform diffusion timestep sampling, squared denoising
-error and the sigmoid DPO objective. Rank, alpha, learning rate, beta, accumulation
-and checkpoint frequency are configurable. Quality labels and reason text are
-recorded only; explicit A/B choices and strength weights supply the loss signal.
+Existing configurations keep AdamW (weight decay 0), constant learning rate and
+unit gradient clipping. The training JSON also supports the installed native
+`SimplifiedAdEMAMixExM` optimizer and a single-cycle RAWR learning-rate schedule.
+These advanced fields are preserved when a config is loaded/saved in the GUI;
+dedicated optimizer widgets are not yet present. For example, within `training`:
 
-After a quality benefit is demonstrated, the next integration targets are the
-trainer's optimizer and learning-rate scheduler factories, warmup and optimizer
-arguments, with checkpoint/resume support for their state. Memory and gradient
-controls can follow. The inference sampler, training noise schedule and learning
-rate schedule are distinct settings and should be labelled separately.
+```json
+{
+  "learning_rate": 0.0004,
+  "max_steps": 100,
+  "optimizer": {
+    "type": "SimplifiedAdEMAMixExM",
+    "args": {
+      "betas": [0.99, 0.997], "beta1_warmup": "total_steps", "min_beta1": 0.95,
+      "alpha": 1.0, "amsgrad_min_decay_rate": 0.96, "amsgrad_max_decay_rate": 0.96,
+      "use_adabelief": true, "torch_compile": false, "update_strategy": "cautious"
+    }
+  },
+  "lr_schedule": {"type": "rawr", "warmup_ratio": 0.05, "min_lr": 0.000001, "gamma": 0.9, "d": 0.9},
+  "max_grad_norm": 0.0
+}
+```
+
+This is an experimental recipe, not a quality recommendation. The simplified
+optimizer names its run-length momentum setting `beta1_warmup`, not `beta3`.
+`"total_steps"` resolves to `max_steps`; a positive fixed integer or null is also
+accepted. RAWR spans `max_steps`, with warmup rounded up to complete optimizer
+steps (five here). The scheduler advances after each accumulated optimizer step.
+`max_grad_norm: 0` disables global norm clipping while still checking finiteness;
+the optimizer's own update bounds remain active. Other native defaults remain
+in effect, except custom `torch_compile` defaults to false. Unsupported options
+are rejected rather than ignored; see `optimization.py` for the allowed fields.
+
+Runs save `optimization.json` and log the learning rate actually used, the next
+rate, and effective momentum beta1 where applicable. Checkpoints include scheduler
+state and preserve offloaded optimizer state precision/location on resume. The
+schedule horizon is fixed for RAWR and automatic momentum warmup: increasing
+`max_steps` then requires a new run. Legacy constant-AdamW resumes can still
+increase it. The inference sampler, diffusion noise schedule and learning-rate
+schedule are separate settings.
+
+Uniform diffusion timestep sampling, squared denoising error and the sigmoid DPO
+objective remain unchanged. Quality labels and reason text are recorded only;
+explicit A/B choices and strength weights supply the loss signal.
 
 Alternative L1/Huber denoising losses, SNR weighting and different preference
 objectives require their own validation. Replacing the squared Gaussian
@@ -359,14 +393,16 @@ Each new run has a unique directory with config, frozen dataset snapshot,
 metrics JSONL, status, and numbered checkpoints containing:
 
 * `preference_lora.safetensors`: UNet adapter plus reference metadata.
-* `training_state.pt`: optimizer and RNG state, loaded with `weights_only=True`.
+* `training_state.pt`: optimizer, optional learning-rate scheduler and RNG state,
+  loaded with `weights_only=True`.
 * `state.json`: step, signature and metrics; `latest.json` in the parent points
   to the latest complete checkpoint.
 
 Set the resume checkpoint directory in the UI, or pass
 `train --config ... --resume ...\checkpoint-000025`. Resume requires the same
-rated dataset and training settings. You may increase `max_steps` or change the
-checkpoint interval. Only the latest checkpoint may continue in the same run.
+rated dataset and training settings. You may change the checkpoint interval, or
+increase `max_steps` if neither RAWR nor automatic momentum warmup fixes the
+schedule horizon. Only the latest checkpoint may continue in the same run.
 To add fresh human ratings between rounds, start a **new run** with the previous
 preference adapter as `model.preference_lora`, clear Resume, and keep the original
 checkpoint/adapters fixed. The reference remains fixed across rounds.
